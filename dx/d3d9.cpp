@@ -3678,8 +3678,8 @@ void Dev_SetVertexShaderConstantF(X86 *c) {
             const uint32_t start = arg(c, 1), count = arg(c, 3);
             for (uint32_t i = 0; i < count && i < 8 && start + i < 256; ++i) {
                 const float *r = pl.vconst[start + i];
-                LOGW("d3d9: vs c%u = %g %g %g %g%s", start + i, r[0], r[1], r[2], r[3],
-                     i == 7 && count > 8 ? " ..." : "");
+                LOGW("d3d9: vs c%u = %g %g %g %g%s (from %08x)", start + i, r[0], r[1], r[2], r[3],
+                     i == 7 && count > 8 ? " ..." : "", rd32(c->r[R_ESP]));
             }
         }
     }
