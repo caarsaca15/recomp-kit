@@ -81,6 +81,9 @@ enum Op : uint32_t {
     OP_TEXCOORD = 64,
     OP_TEXKILL = 65,
     OP_TEX = 66,
+    OP_TEXBEM = 67,     // ps.1.x: stage dst at texcoord[dst] + BUMPENVMAT * src.rg
+    OP_TEXREG2AR = 69,  // ps.1.x: samples stage dst at (src.a, src.r)
+    OP_TEXREG2GB = 70,  // ps.1.x: samples stage dst at (src.g, src.b)
     OP_TEXM3X2PAD = 71, // ps.1.x: u = dot(texcoord[dst].xyz, src.rgb)
     OP_TEXM3X2TEX = 72, // ps.1.x: v likewise; samples stage dst at (u, v)
     OP_TEXLDL = 95,
@@ -153,6 +156,16 @@ const Program &program_for(const std::vector<uint8_t> &code);
 // distinguishes END from the same bits in a constant or comment payload.
 size_t instruction_words(uint32_t version, uint32_t opcode);
 bool bytecode_extent(const uint8_t *code, size_t available, size_t *bytes, std::string *why);
+
+// Whether a vertex declaration element (usage, index) feeds a vertex shader
+// input declared as (usage, index): the usages and indices must be equal. A
+// D3DDECLUSAGE_POSITIONT declaration never reaches a game's vertex shader at
+// all - Direct3D 9 skips vertex processing for it (see d3d9.cpp,
+// declaration_pretransformed) - so it needs no rule here.
+inline bool decl_usage_matches(uint32_t elem_usage, uint32_t elem_index, uint32_t in_usage,
+                               uint32_t in_index) {
+    return elem_usage == in_usage && elem_index == in_index;
+}
 // The key that names a program's bytes (64-bit FNV-1a, never zero), and the
 // program cached under it: the per-draw path looks programs up by key.
 uint64_t code_key(const uint8_t *code, size_t size);

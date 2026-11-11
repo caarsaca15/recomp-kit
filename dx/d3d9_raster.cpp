@@ -673,6 +673,20 @@ struct Machine {
                 o = texture_op(in.dst.index, uv);
                 break;
             }
+            case OP_TEXBEM: // unperturbed, as in the GPU programs (see d3d9_shadergen.cpp)
+                o = texture_op(in.dst.index, tex[in.dst.index & 7]);
+                break;
+            case OP_TEXREG2AR:
+            case OP_TEXREG2GB: {
+                V4 a = read(s[0]), uv;
+                const bool ar = in.op == OP_TEXREG2AR;
+                uv[0] = ar ? a[3] : a[1];
+                uv[1] = ar ? a[0] : a[2];
+                uv[2] = 0;
+                uv[3] = 1;
+                o = texture_op(in.dst.index, uv);
+                break;
+            }
             case OP_TEXDP3: {
                 V4 a = read(s[0]);
                 V4 t = tex[in.dst.index & 7];
@@ -1058,6 +1072,12 @@ void d9_raster_draw(ComObj *device, ComObj *target, const std::vector<uint8_t> &
     // Run the vertex shader once per used vertex.
     std::unordered_map<int64_t, Out> transformed;
     uint32_t instance = 0;
+    char skip_note[160] = "";
+    bool first_input_seen = false;
+    V4 first_input{};
+    const char *first_input_src = "none";
+    int first_input_locked = 0;
+    (void)first_input_locked;
     auto shade_vertex = [&](int64_t vi) -> const Out & {
         auto it = transformed.find(vi);
         if (it != transformed.end())
@@ -1068,7 +1088,7 @@ void d9_raster_draw(ComObj *device, ComObj *target, const std::vector<uint8_t> &
         if (vi >= 0)
             for (const DclIn &d : vs.inputs)
                 for (const Elem &e : elems)
-                    if (e.usage == d.usage && e.index == d.usage_index) {
+                    if (decl_usage_matches(e.usage, e.index, d.usage, d.usage_index)) {
                         const auto &stream = pl.stream[e.stream];
                         const uint32_t rate = host_d9_stream_rate(stream.frequency);
                         const uint64_t index = (stream.frequency & HOST_D9_STREAM_INSTANCE)
@@ -1093,13 +1113,28 @@ void d9_raster_draw(ComObj *device, ComObj *target, const std::vector<uint8_t> &
                         }
                         const uint32_t bytes = element_bytes(e.type);
                         if (!data || !bytes || (stride && e.offset + bytes > stride) ||
-                            offset > size || e.offset + bytes > size - offset)
+                            offset > size || e.offset + bytes > size - offset) {
+                            if (!first_input_seen && d.usage == 0 && !skip_note[0]) {
+                                snprintf(skip_note, sizeof skip_note,
+                                         "skipped: stream %u data %s bytes %u stride %u offset "
+                                         "%llu size %llu elem offset %u",
+                                         e.stream, data ? "yes" : "null", bytes, stride,
+                                         (unsigned long long)offset, (unsigned long long)size,
+                                         e.offset);
+                            }
                             continue;
+                        }
                         const uint64_t available = size - offset - e.offset - bytes;
                         if (stride && index > available / stride)
                             continue;
                         offset += index * stride;
                         m.in[d.index & 15] = fetch(data + offset, e);
+                        if (!first_input_seen && d.usage == 0) {
+                            first_input_seen = true;
+                            first_input = m.in[d.index & 15];
+                            first_input_src = e.stream ? "vertex buffer" : "user pointer";
+                            first_input_locked = !e.stream ? 0 : 1;
+                        }
                     }
         m.run();
         Out o;
@@ -1310,8 +1345,31 @@ void d9_raster_draw(ComObj *device, ComObj *target, const std::vector<uint8_t> &
     static uint32_t reported = 0;
     if (++reported <= 16)
         LOGW("d3d9 raster: draw into %u (%ux%u): first vertex w %g, %u pixels written, first "
-             "colour %.2f %.2f %.2f %.2f",
+             "colour %.2f %.2f %.2f %.2f; first position input %g %g %g %g from %s",
              target->id, rt.width, rt.height, (double)first_w, written, (double)sample_colour[0],
-             (double)sample_colour[1], (double)sample_colour[2], (double)sample_colour[3]);
+             (double)sample_colour[1], (double)sample_colour[2], (double)sample_colour[3],
+             (double)first_input[0], (double)first_input[1], (double)first_input[2],
+             (double)first_input[3],
+             first_input_seen ? first_input_src
+                              : (skip_note[0] ? skip_note : "no matching element"));
+    if (reported <= 16 && !first_input_seen)
+        LOGW("d3d9 raster:   %zu declaration elements, %zu shader inputs, stride %u, user data %s, "
+             "vertices %08x, %u vertices",
+             elems.size(), vs.inputs.size(), call.stride, call.vertex_data ? "yes" : "no",
+             call.vertices, nverts);
+    if (reported <= 4 && !first_input_seen) {
+        std::string el, in;
+        char t[48];
+        for (const Elem &e : elems) {
+            snprintf(t, sizeof t, " s%u+%u:t%u:u%u.%u", e.stream, e.offset, e.type, e.usage,
+                     e.index);
+            el += t;
+        }
+        for (const DclIn &d : vs.inputs) {
+            snprintf(t, sizeof t, " v%u:u%u.%u", d.index, d.usage, d.usage_index);
+            in += t;
+        }
+        LOGW("d3d9 raster:   elements%s; inputs%s", el.c_str(), in.c_str());
+    }
     d9_raster_invalidate(target->id);
 }

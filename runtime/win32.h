@@ -52,6 +52,10 @@ void set_last_error(uint32_t code);
 // reset). False when the handle is not an event. Used by WINMM's event-mode
 // multimedia timers.
 bool win32_signal_event(uint32_t handle, bool pulse);
+// Debugging: every guest thread and the state of each object a blocked one waits
+// for, on stderr. Takes the scheduler lock only if it is free, so it can run
+// from a signal handler on a wedged process (see RECOMP_GUEST_DUMP).
+void win32_debug_dump_threads();
 // A kernel event object made by a shim on the guest's behalf (a DirectShow
 // graph's completion event), handed to the guest as a handle it can wait on
 // and close like one CreateEventA returned.

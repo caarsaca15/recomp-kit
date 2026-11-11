@@ -28,6 +28,9 @@ int operand_count(uint32_t op, uint32_t major, uint32_t minor, bool pixel) {
     case OP_LOGP:
     case OP_TEXM3X2PAD:
     case OP_TEXM3X2TEX:
+    case OP_TEXBEM:
+    case OP_TEXREG2AR:
+    case OP_TEXREG2GB:
     case OP_TEXDP3:
         return 2;
     case OP_DSX:

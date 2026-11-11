@@ -595,6 +595,13 @@ static LONG WINAPI fault_filter(EXCEPTION_POINTERS *info) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
+int os_install_user_signal(OsUserSignalFn) {
+    return 0; // no SIGUSR1 on Windows
+}
+int os_write_file_raw(const char *, const void *, size_t) {
+    return -1;
+}
+
 int os_install_fault_handlers(OsFaultFn fn) {
     g_fault_fn = fn;
     // Our stderr diagnostics own fault reporting. UCRT abort() otherwise

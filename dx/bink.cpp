@@ -724,9 +724,15 @@ void BinkCopyToBuffer(X86 *c) {
     if (!p || !p->have_frame || p->failed)
         return;
     uint32_t type = arg(c, 6) & 0xff;
-    if (type != VIDEO_RGB565 && type != VIDEO_RGB555 && type != VIDEO_XRGB8888)
+    if (type != VIDEO_RGB565 && type != VIDEO_RGB555 && type != VIDEO_XRGB8888 &&
+        type != VIDEO_ARGB8888) {
+        char key[40];
+        snprintf(key, sizeof key, "bink.copy.type.%u", type);
+        log_once(key, "bink: BinkCopyToBuffer surface type %u is not supported; frame not copied",
+                 type);
         return;
-    uint64_t bpp = type == VIDEO_XRGB8888 ? 4 : 2;
+    }
+    uint64_t bpp = type == VIDEO_XRGB8888 || type == VIDEO_ARGB8888 ? 4 : 2;
     uint64_t pitch = arg(c, 2), xbytes = (uint64_t)arg(c, 4) * bpp;
     uint64_t rows = std::min(arg(c, 3), (uint32_t)p->frame->height);
     uint64_t row_bytes = (uint64_t)p->frame->width * bpp;

@@ -1873,7 +1873,8 @@ class WebGpuRenderer final : public D9Backend {
                     break;
                 uint16_t offset = (uint16_t)(e[2] | e[3] << 8);
                 uint8_t type = e[4], usage = e[6], index = e[7];
-                if (usage != in.usage || index != in.usage_index || stream >= 8)
+                if (!d9sh::decl_usage_matches(usage, index, in.usage, in.usage_index) ||
+                    stream >= 8)
                     continue;
                 WGPUVertexFormat fmt;
                 float scale[4];

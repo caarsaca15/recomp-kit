@@ -157,6 +157,7 @@ enum ComIface : uint16_t {
     IF_D3DSURFACE8,
     IF_D3DVERTEXBUFFER8,
     IF_D3DINDEXBUFFER8,
+    IF_DSBUFFER8,
     IF_COUNT
 };
 

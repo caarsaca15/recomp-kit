@@ -506,8 +506,6 @@ D9_STUB(SetDialogBoxMode, 2)
 D9_STUB(SetGammaRamp, 4)
 D9_STUB(GetGammaRamp, 3)
 D9_STUB(CreateVolumeTexture, 9)
-D9_STUB(UpdateSurface, 5)
-D9_STUB(UpdateTexture, 3)
 D9_STUB(GetRenderTargetData, 3)
 D9_STUB(GetFrontBufferData, 3)
 D9_STUB(ColorFill, 4)
@@ -812,13 +810,31 @@ static void create_shader(X86 *c, bool pixel) {
     }
     const uint32_t version = rd32(code), major = (version >> 8) & 255, minor = version & 255;
     size_t bytes = 0;
+    std::string why = "unsupported version";
     if ((version >> 16) != (pixel ? 0xffffu : 0xfffeu) ||
         !((major == 1 && minor >= 1 && minor <= (pixel ? 4u : 1u)) ||
           ((major == 2 || major == 3) && !minor)) ||
         !d9sh::bytecode_extent(gm_ptr(code), std::min<size_t>(GUEST_SIZE - code, 1u << 20), &bytes,
-                               nullptr)) {
+                               &why)) {
+        // The first tokens say which instruction the walk stopped at.
+        char key[48], head[200];
+        int used = 0;
+        for (uint32_t i = 0; i < 16 && gm_valid(code + i * 4, 4) && used < (int)sizeof head - 10;
+             ++i)
+            used += snprintf(head + used, sizeof head - used, " %08x", rd32(code + i * 4));
+        snprintf(key, sizeof key, "d3d9-shader-refused:%08x", version);
+        log_once(key, "d3d9: Create%sShader refused %s_%u_%u: %s; tokens%s",
+                 pixel ? "Pixel" : "Vertex", pixel ? "ps" : "vs", major, minor, why.c_str(), head);
         com_ret(c, D3DERR_INVALIDCALL);
         return;
+    }
+    // RECOMP_D3D9_TRACE_DECLS also lists each shader's first tokens.
+    if (recomp_env("D3D9_TRACE_DECLS")) {
+        char head[400];
+        int used = 0;
+        for (uint32_t i = 0; i < 40 && i < bytes / 4 && used < (int)sizeof head - 10; ++i)
+            used += snprintf(head + used, sizeof head - used, " %08x", rd32(code + i * 4));
+        LOGW("d3d9: Create%sShader %zu bytes:%s", pixel ? "Pixel" : "Vertex", bytes, head);
     }
     ComObj *shader = com_new(pixel ? K_D3D9PS : K_D3D9VS);
     if (!shader) {
@@ -1074,7 +1090,19 @@ void Dev_Clear(X86 *c) {
 // (this, pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion). The back
 // buffer goes to the host as a 32-bit frame: the first thing this module puts
 // on screen.
+// RECOMP_D3D9_TRACE_FRAME=N: every draw of the N-th presented frame, with the
+// state that decides whether it shows (see trace_draw).
+static uint32_t g_presented_frames = 0;
+static bool tracing_frame() {
+    static long want = -2;
+    if (want == -2) {
+        const char *v = recomp_env("D3D9_TRACE_FRAME");
+        want = v ? strtol(v, nullptr, 0) : -1;
+    }
+    return want >= 0 && g_presented_frames == (uint32_t)want;
+}
 void Dev_Present(X86 *c) {
+    ++g_presented_frames;
     ComObj *dev = this_device9(c);
     ComObj *bb = dev ? device_backbuffer(dev) : nullptr;
     if (bb && gpu_on()) {
@@ -2133,6 +2161,11 @@ void Dev_CreateVertexDeclaration(X86 *c) {
             d->blob.push_back(gm_ptr(e)[b]);
         if (stream == 0xff)
             break;
+        // RECOMP_D3D9_TRACE_DECLS: every element (stream, offset, type, usage, index).
+        if (recomp_env("D3D9_TRACE_DECLS"))
+            LOGW("d3d9: decl id %u element %u: stream %u offset %u type %u method %u usage %u "
+                 "index %u",
+                 d->id, i, stream, rd16(e + 2), rd8(e + 4), rd8(e + 5), rd8(e + 6), rd8(e + 7));
     }
     uint32_t view_ = d9_api_view(d, IF_D3DVERTEXDECL9);
     if (!view_) {
@@ -2428,6 +2461,25 @@ static void ffp_announce(d9ffp::Program &p, bool pixel) {
 // was skipped before: NFSMW's highlighted menu labels are drawn this way. Kept
 // apart from gpu_draw so a draw with both shaders pays nothing for it; the
 // rest follows gpu_draw, and the constants carry no serial (read every time).
+// A declaration whose position is D3DDECLUSAGE_POSITIONT holds vertices the
+// game has already transformed to screen pixels, and Direct3D 9 skips vertex
+// processing for them: a vertex shader left bound from the 3D pass is not run.
+// Games rely on that: one draws its menus, text, videos and full-screen passes
+// this way with the scene's shader still set, and running that shader sent
+// every quad off the screen.
+static bool declaration_pretransformed(const ComObj *decl) {
+    if (!decl || decl->kind != K_D3D9DECL)
+        return false;
+    for (size_t i = 0; i + 8 <= decl->blob.size(); i += 8) {
+        const uint8_t *e = decl->blob.data() + i;
+        if ((e[0] | e[1] << 8) == 0xff)
+            break;
+        if (e[6] == 9 && e[7] == 0) // POSITIONT, index 0
+            return true;
+    }
+    return false;
+}
+
 static void gpu_draw_fixed(ComObj *dev, HostD9Draw &d) {
     D9Pipeline &pl = d9_pipeline(dev->id);
     ComObj *decl = com_get(pl.declaration);
@@ -2443,7 +2495,8 @@ static void gpu_draw_fixed(ComObj *dev, HostD9Draw &d) {
     d.depth_range[1] = pl.viewport_z[1];
     for (int i = 0; i < 4; ++i)
         d.scissor[i] = pl.scissor[i];
-    if (!pl.vs.empty()) {
+    const bool pretransformed = declaration_pretransformed(decl);
+    if (!pl.vs.empty() && !pretransformed) {
         if (!pl.vs_key)
             pl.vs_key = d9sh::code_key(pl.vs.data(), pl.vs.size());
         const d9sh::Program &vs = d9sh::program_for_key(pl.vs_key, pl.vs.data(), pl.vs.size());
@@ -2485,7 +2538,7 @@ static void gpu_draw_fixed(ComObj *dev, HostD9Draw &d) {
     if (++ffp_draws == 1 || (ffp_draws & (ffp_draws - 1)) == 0)
         LOGW("d3d9: %llu draws through the fixed-function pipeline so far (this one: %s vertex, "
              "%s pixel)",
-             (unsigned long long)ffp_draws, pl.vs.empty() ? "fixed" : "shader",
+             (unsigned long long)ffp_draws, pl.vs.empty() || pretransformed ? "fixed" : "shader",
              pl.ps.empty() ? "fixed" : "shader");
     d.decl = decl->blob.data();
     d.decl_size = (uint32_t)decl->blob.size();
@@ -2530,9 +2583,50 @@ static void gpu_draw_fixed(ComObj *dev, HostD9Draw &d) {
 }
 
 // One draw, handed to the GPU renderer with everything the device has bound.
+static void trace_draw(ComObj *dev, const HostD9Draw &d) {
+    const D9Pipeline &pl = d9_pipeline(dev->id);
+    const uint32_t *rs = pl.rs;
+    ComObj *rt = com_get(pl.color_target[0]);
+    LOGW(
+        "d3d9 frame %u draw: prim %u x%u %s fvf %x decl %u vs %s ps %s | rt %u %ux%u vp %u,%u %ux%u"
+        " | z %u zw %u zf %u cull %u | blend %u %u/%u at %u ref %u fn %u | cw %x fog %u light %u"
+        " | tex0 %u op %u/%u arg %u,%u",
+        g_presented_frames, d.primitive, d.primitive_count, d.index_buffer ? "indexed" : "",
+        fixed_state(dev->id).fvf, pl.declaration, pl.vs_key ? "yes" : "no",
+        pl.ps_key ? "yes" : "no", pl.color_target[0], rt ? rt->width : 0, rt ? rt->height : 0,
+        pl.viewport[0], pl.viewport[1], pl.viewport[2], pl.viewport[3], rs[7], rs[14], rs[23],
+        rs[22], rs[27], rs[19], rs[20], rs[15], rs[24], rs[25], rs[168], rs[28], rs[137],
+        pl.sampler_tex[0], pl.tss[0][1], pl.tss[0][4], pl.tss[0][2], pl.tss[0][3]);
+    // The first vertex the draw reads, as raw floats/words, and the first matrix.
+    ComObj *vb = com_get(pl.stream[0].vb), *ib = com_get(d.index_buffer);
+    if (vb && !vb->blob.empty() && pl.stream[0].stride) {
+        uint32_t index = d.start;
+        if (ib && !ib->blob.empty()) {
+            const uint32_t size = ib->rmask ? ib->rmask : 2, at = d.start * size;
+            if (at + size <= ib->blob.size())
+                index = size == 4 ? *(const uint32_t *)(ib->blob.data() + at)
+                                  : *(const uint16_t *)(ib->blob.data() + at);
+            index += (uint32_t)d.base_vertex;
+        }
+        const size_t at = pl.stream[0].offset + (size_t)index * pl.stream[0].stride;
+        if (at + 24 <= vb->blob.size()) {
+            const uint8_t *v = vb->blob.data() + at;
+            float f[6];
+            memcpy(f, v, sizeof f);
+            LOGW("d3d9 frame %u   vertex %u: %g %g %g %g | word4 %08x | %g %g", g_presented_frames,
+                 index, f[0], f[1], f[2], f[3], *(const uint32_t *)(v + 16), f[5],
+                 at + 28 <= vb->blob.size() ? *(const float *)(v + 24) : 0.0f);
+        }
+    }
+    for (int r = 0; r < 4; ++r)
+        LOGW("d3d9 frame %u   c%d = %g %g %g %g", g_presented_frames, r, pl.vconst[r][0],
+             pl.vconst[r][1], pl.vconst[r][2], pl.vconst[r][3]);
+}
 static void gpu_draw(ComObj *dev, HostD9Draw &d) {
+    if (tracing_frame())
+        trace_draw(dev, d);
     D9Pipeline &pl = d9_pipeline(dev->id);
-    if (pl.vs.empty() || pl.ps.empty()) {
+    if (pl.vs.empty() || pl.ps.empty() || declaration_pretransformed(com_get(pl.declaration))) {
         // RECOMP_D3D9_FFP=0 skips these draws, as the shim did before it had a
         // fixed-function pipeline.
         static const bool ffp = [] {
@@ -2876,7 +2970,32 @@ RES_STUB(Res, FreePrivateData)
 RES_STUB(Res, SetPriority)
 RES_STUB(Res, GetPriority)
 RES_STUB(Res, PreLoad)
-RES_STUB(Res, GetType)
+// IDirect3DResource9::GetType: the D3DRESOURCETYPE of what this object is.
+// D3DX asks before choosing how to treat a resource, so 0 (no type) is not
+// a safe answer. A texture with caps set is a cube (Dev_CreateCubeTexture).
+void Res_GetType(X86 *c) {
+    const ComObj *r = com_this_arg(c);
+    uint32_t type = 0;
+    if (r) {
+        switch (r->kind) {
+        case K_D3D9SURFACE:
+            type = 1; // D3DRTYPE_SURFACE
+            break;
+        case K_D3D9TEXTURE:
+            type = r->caps ? 5u : 3u; // D3DRTYPE_CUBETEXTURE : D3DRTYPE_TEXTURE
+            break;
+        case K_D3D9VB:
+            type = 6; // D3DRTYPE_VERTEXBUFFER
+            break;
+        case K_D3D9IB:
+            type = 7; // D3DRTYPE_INDEXBUFFER
+            break;
+        default:
+            break;
+        }
+    }
+    set_eax(c, type);
+}
 RES_STUB(Tex, SetLOD)
 RES_STUB(Tex, GetLOD)
 RES_STUB(Tex, SetAutoGenFilterType)
@@ -3128,6 +3247,93 @@ void Tex_LockRect(X86 *c) {
 void Tex_UnlockRect(X86 *c) {
     stage_unlock(texture_level(com_this_arg(c), arg(c, 1)));
     com_ret(c, D3D_OK9);
+}
+
+// ---- Copies between pools ---------------------------------------------------
+// UpdateSurface and UpdateTexture move bytes from a D3DPOOL_SYSTEMMEM resource
+// into a D3DPOOL_DEFAULT one. Here every resource keeps its bytes the same
+// way, so a copy is a lock of the destination, the source's bytes written in,
+// and an unlock - which is also what sends the result on to the GPU.
+
+// Copies rows of `src` into `dst`. Without rectangles the whole surface goes
+// (the two must then match in size and format); with them, an uncompressed
+// format copies the source rectangle to the destination point.
+static bool copy_surface(ComObj *src, ComObj *dst, uint32_t rect, uint32_t point) {
+    if (!src || !dst || src->kind != K_D3D9SURFACE || dst->kind != K_D3D9SURFACE ||
+        src->rmask != dst->rmask)
+        return false;
+    const uint8_t *from = src->pixels ? gm_ptr(src->pixels) : src->blob.data();
+    if (!from || src->blob.empty())
+        return false;
+    if (!rect && !point) {
+        if (src->width != dst->width || src->height != dst->height ||
+            src->blob.size() != dst->blob.size())
+            return false;
+        const uint32_t to = stage_lock(dst);
+        if (!to)
+            return false;
+        memcpy(gm_ptr(to), from, dst->blob.size());
+        stage_unlock(dst);
+        return true;
+    }
+    if (!src->bpp) // a block-compressed rectangle: not needed so far
+        return false;
+    int32_t r[4] = {0, 0, (int32_t)src->width, (int32_t)src->height};
+    if (rect)
+        for (int i = 0; i < 4; ++i)
+            r[i] = (int32_t)rd32(rect + 4u * (uint32_t)i);
+    int32_t px = point ? (int32_t)rd32(point) : r[0], py = point ? (int32_t)rd32(point + 4) : r[1];
+    const int32_t w = r[2] - r[0], h = r[3] - r[1];
+    if (w <= 0 || h <= 0 || r[0] < 0 || r[1] < 0 || px < 0 || py < 0 ||
+        r[2] > (int32_t)src->width || r[3] > (int32_t)src->height || px + w > (int32_t)dst->width ||
+        py + h > (int32_t)dst->height)
+        return false;
+    const uint32_t bytes = src->bpp / 8, to = stage_lock(dst);
+    if (!to)
+        return false;
+    for (int32_t y = 0; y < h; ++y)
+        memcpy(gm_ptr(to) + (size_t)(py + y) * dst->pitch + (size_t)px * bytes,
+               from + (size_t)(r[1] + y) * src->pitch + (size_t)r[0] * bytes, (size_t)w * bytes);
+    stage_unlock(dst);
+    return true;
+}
+
+// (this, pSourceSurface, pSourceRect, pDestinationSurface, pDestPoint)
+void Dev_UpdateSurface(X86 *c) {
+    const bool ok = copy_surface(com_this(arg(c, 1)), com_this(arg(c, 3)), arg(c, 2), arg(c, 4));
+    com_ret(c, ok ? D3D_OK9 : D3DERR_INVALIDCALL);
+}
+
+// (this, pSourceTexture, pDestinationTexture): every level the destination
+// has, matched to the source level of the same size (a source may carry more
+// levels at the top), and all six faces of a cube.
+void Dev_UpdateTexture(X86 *c) {
+    ComObj *src = com_this(arg(c, 1)), *dst = com_this(arg(c, 2));
+    if (!src || !dst || src->kind != K_D3D9TEXTURE || dst->kind != K_D3D9TEXTURE ||
+        !src->caps != !dst->caps) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    auto levels = [](ComObj *t) -> uint32_t {
+        if (t->caps)
+            return t->pal_flags ? t->pal_flags : 1; // a cube keeps its level count here
+        return std::max<uint32_t>(1, (uint32_t)t->surfaces.size());
+    };
+    const uint32_t sl = levels(src), dl = levels(dst);
+    if (sl < dl) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    const uint32_t skip = sl - dl;
+    bool ok = true;
+    for (uint32_t face = 0; face < (src->caps ? 6u : 1u); ++face)
+        for (uint32_t level = 0; level < dl; ++level) {
+            ComObj *from =
+                src->caps ? cube_face(src, face, level + skip) : texture_level(src, level + skip);
+            ComObj *to = dst->caps ? cube_face(dst, face, level) : texture_level(dst, level);
+            ok = copy_surface(from, to, 0, 0) && ok;
+        }
+    com_ret(c, ok ? D3D_OK9 : D3DERR_INVALIDCALL);
 }
 
 // D3DQUERYTYPE: 8 is EVENT, 9 OCCLUSION. An occlusion query with a GPU
@@ -3460,6 +3666,22 @@ void Dev_SetVertexShaderConstantF(X86 *c) {
         D9Pipeline &pl = d9_pipeline(dev->id);
         write_registers(pl.vconst, 256, arg(c, 1), arg(c, 2), arg(c, 3));
         pl.vconst_serial = d9_const_serial();
+        // RECOMP_D3D9_TRACE_CONSTANTS=N: the first N uploads and their values,
+        // for telling a shader that gets no matrices from one that ignores them.
+        static long budget = -1;
+        if (budget < 0) {
+            const char *v = recomp_env("D3D9_TRACE_CONSTANTS");
+            budget = v ? strtol(v, nullptr, 0) : 0;
+        }
+        if (budget > 0) {
+            --budget;
+            const uint32_t start = arg(c, 1), count = arg(c, 3);
+            for (uint32_t i = 0; i < count && i < 8 && start + i < 256; ++i) {
+                const float *r = pl.vconst[start + i];
+                LOGW("d3d9: vs c%u = %g %g %g %g%s", start + i, r[0], r[1], r[2], r[3],
+                     i == 7 && count > 8 ? " ..." : "");
+            }
+        }
     }
     com_ret(c, D3D_OK9);
 }

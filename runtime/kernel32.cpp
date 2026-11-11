@@ -63,6 +63,22 @@ static const uint32_t FILE_ATTRIBUTE_ARCHIVE_ = 0x020;
 static const uint32_t FILE_ATTRIBUTE_NORMAL_ = 0x080;
 
 namespace {
+extern __thread size_t t_self; // defined with the scheduler, below
+// RECOMP_TRACE_HANDLE / RECOMP_TRACE_CS (hex): every signal, reset and wait on
+// one event, and every entry to and exit from one critical section, with the
+// guest thread that did it - for finding a lost wake-up.
+static uint32_t traced_value(const char *name) {
+    const char *v = recomp_env(name);
+    return v ? (uint32_t)strtoul(v, nullptr, 0) : 0;
+}
+static bool traced_handle(uint32_t h) {
+    static const uint32_t want = traced_value("TRACE_HANDLE");
+    return want && h == want;
+}
+static bool traced_cs(uint32_t cs) {
+    static const uint32_t want = traced_value("TRACE_CS");
+    return want && cs == want;
+}
 
 // ---------------------------------------------------------------------------
 // Process-wide state
@@ -512,6 +528,7 @@ bool win32_reset_event(uint32_t handle) {
 
 namespace {
 void pulse_event(HObj *o); // with the scheduler, below
+void set_event(HObj *o);   // with the scheduler, below
 } // namespace
 bool win32_signal_event(uint32_t handle, bool pulse) {
     HObj *o = handle_get(handle, H_EVENT);
@@ -1589,6 +1606,15 @@ void k_GetVersion(X86 *c) {
     set_eax(c, windows_version::packed);
 }
 
+// IsProcessorFeaturePresent(feature): agrees with recomp_cpuid, which
+// advertises FPU, TSC and CMOV only. PF_RDTSC_INSTRUCTION_AVAILABLE (8) is the
+// one feature constant those cover; MMX, SSE, 3DNow!, CMPXCHG8B and the rest
+// report FALSE, so a CRT or library that asks here picks the same scalar paths
+// as one that runs CPUID itself.
+void k_IsProcessorFeaturePresent(X86 *c) {
+    set_eax(c, arg(c, 0) == 8u ? 1u : 0u);
+}
+
 void k_GetStdHandle(X86 *c) {
     int32_t which = (int32_t)arg(c, 0);
     int fd = which == -10 ? 0 : which == -11 ? 1 : 2;
@@ -1924,6 +1950,13 @@ void k_InterlockedExchange(X86 *c) {
     set_eax(c, recomp_lock_xchg32(arg(c, 0), arg(c, 1)));
 }
 
+// InterlockedCompareExchange(dest, exchange, comperand): stores exchange when
+// *dest equals comperand and returns the value *dest held before, like LOCK
+// CMPXCHG.
+void k_InterlockedCompareExchange(X86 *c) {
+    set_eax(c, recomp_lock_cmpxchg32(arg(c, 0), arg(c, 2), arg(c, 1)));
+}
+
 // CRITICAL_SECTION is 24 bytes. The fields the guest can read are kept where
 // Windows keeps them: LockCount at +4, RecursionCount at +8, OwningThread at
 // +12. Ownership is not decoration now that guest threads interleave - a yield
@@ -1939,7 +1972,12 @@ void k_InitializeCriticalSection(X86 *c) {
 }
 void k_EnterCriticalSection(X86 *c) {
     imports_call_leaves_surfaces();
+    if (traced_cs(arg(c, 0)))
+        LOGW("trace: thread %zu enter CS %08x (scheduled, ret %08x)", t_self, arg(c, 0),
+             rd32(c->r[R_ESP]));
     sched_enter_critsec(arg(c, 0));
+    if (traced_cs(arg(c, 0)))
+        LOGW("trace: thread %zu holds CS %08x (scheduled)", t_self, arg(c, 0));
     set_eax(c, 0);
 }
 void k_TryEnterCriticalSection(X86 *c) {
@@ -1948,6 +1986,8 @@ void k_TryEnterCriticalSection(X86 *c) {
 }
 void k_LeaveCriticalSection(X86 *c) {
     imports_call_leaves_surfaces();
+    if (traced_cs(arg(c, 0)))
+        LOGW("trace: thread %zu leave CS %08x (scheduled)", t_self, arg(c, 0));
     sched_leave_critsec(arg(c, 0));
     set_eax(c, 0);
 }
@@ -1990,6 +2030,8 @@ void k_CreateEventA(X86 *c) {
     create_event_named(c, gm_str(arg(c, 3)));
 }
 void k_ResetEvent(X86 *c) {
+    if (traced_handle(arg(c, 0)))
+        LOGW("trace: thread %zu ResetEvent %08x (ret %08x)", t_self, arg(c, 0), rd32(c->r[R_ESP]));
     HObj *o = handle_get(arg(c, 0), H_EVENT);
     if (o)
         o->signalled = false;
@@ -2033,12 +2075,18 @@ void k_PulseEvent(X86 *c) {
     set_eax(c, o ? 1 : 0);
 }
 
+// SetEvent releases the threads waiting on the event at the moment it is set,
+// as Windows does: every waiter of a manual-reset event (one of an auto-reset
+// event, which the first taker clears). Leaving the check to the scheduler's
+// next look let a ResetEvent in between undo the signal for a waiter that had
+// not been looked at yet. A game whose two read workers wait on one manual-reset
+// event lost a queued read that way.
 void k_SetEvent(X86 *c) {
+    if (traced_handle(arg(c, 0)))
+        LOGW("trace: thread %zu SetEvent %08x (ret %08x)", t_self, arg(c, 0), rd32(c->r[R_ESP]));
     HObj *o = handle_get(arg(c, 0), H_EVENT);
-    if (o) {
-        o->signalled = true;
-        sched_wake_all();
-    }
+    if (o)
+        set_event(o);
     set_eax(c, o ? 1 : 0);
 }
 
@@ -2048,7 +2096,15 @@ void k_WaitForSingleObject(X86 *c) {
 }
 
 void k_WaitForMultipleObjects(X86 *c) {
+    const uint32_t n = arg(c, 0), hs = arg(c, 1);
+    bool traced = false;
+    for (uint32_t i = 0; i < n && i < 64 && hs; ++i)
+        traced |= traced_handle(rd32(hs + 4 * i));
+    if (traced)
+        LOGW("trace: thread %zu waits (multiple)", t_self);
     wait_multiple_objects(c);
+    if (traced)
+        LOGW("trace: thread %zu woke: %08x", t_self, c->r[R_EAX]);
 }
 
 // -------------------------------------------------------------------------
@@ -2202,6 +2258,7 @@ bool g_exit_requested = false; // a guest thread called ExitProcess
 uint32_t g_exit_requested_code = 0;
 uint32_t g_next_thread_id = 2; // 1 is the main thread
 __thread size_t t_self = 0;    // this host thread's index in threads()
+
 // This host thread's guest thread, for the baton-free shims: set where a worker starts, so
 // they need not index threads(), which the baton holder may grow meanwhile. Null on the main
 // thread, whose baton-free calls take the baton instead.
@@ -2583,6 +2640,30 @@ void dump_scheduler_locked(const char *what, size_t me) {
     }
     fflush(stderr);
 }
+
+} // namespace
+void win32_debug_dump_threads() {
+    const bool locked = g_sched_m.try_lock();
+    dump_scheduler_locked(locked ? "debug dump" : "debug dump (scheduler busy, unlocked read)",
+                          t_self);
+    for (GuestThread *t : threads()) {
+        if (!t->blocked || t->wait_kind != W_OBJECTS)
+            continue;
+        for (uint32_t i = 0; i < t->wait_n; ++i) {
+            const HObj *o = handle_any(t->wait_h[i]);
+            fprintf(stderr,
+                    "[sched]   thread %zu waits%s on %08x: %s kind %d signalled %d manual %d "
+                    "count %d owner %u\n",
+                    t->index, t->wait_all ? " (all)" : "", t->wait_h[i], o ? "" : "MISSING",
+                    o ? (int)o->kind : -1, o ? (int)o->signalled : 0, o ? (int)o->manual_reset : 0,
+                    o ? (int)o->count : 0, o ? o->owner_tid : 0);
+        }
+    }
+    fflush(stderr);
+    if (locked)
+        g_sched_m.unlock();
+}
+namespace {
 
 bool thread_runnable(const GuestThread *t) {
     if (t->finished)
@@ -3628,6 +3709,18 @@ namespace {
 // whole timeout.
 void sched_wake_all() {
     g_sched_m.lock();
+    sched_notify_object_locked();
+    g_sched_m.unlock();
+}
+
+// SetEvent's body (above k_SetEvent): signalled, and every wait that it can
+// complete taken now, under the same lock as the signal.
+void set_event(HObj *o) {
+    g_sched_m.lock();
+    o->signalled = true;
+    for (GuestThread *t : threads())
+        if (t->blocked && t->wait_kind == W_OBJECTS)
+            sched_satisfy_locked(t);
     sched_notify_object_locked();
     g_sched_m.unlock();
 }
@@ -5312,6 +5405,8 @@ void find_first_named(X86 *c, const std::string &pattern, bool wide) {
         std::string host_dir = dirpart.empty() ? win32_host_path_op(".", WIN32_FILE_LIST)
                                                : win32_host_path_op(dirpart, WIN32_FILE_LIST);
         if (host_dir.empty()) {
+            if (recomp_env("TRACE_FILES"))
+                LOGW("file: find \"%s\" -> directory not found", pattern.c_str());
             handles().erase(h);
             set_last_error(ERROR_PATH_NOT_FOUND_);
             set_eax(c, INVALID_HANDLE_VALUE_);
@@ -5324,6 +5419,23 @@ void find_first_named(X86 *c, const std::string &pattern, bool wide) {
                 o.match_paths.push_back(host_dir + "/" + kv.second);
             }
     }
+    // A pattern without wildcards names one entry, and Windows finds it whether
+    // or not its parent can be listed: an engine that asks for its own install
+    // directory by name (Jade checks the folder it runs from this way) gets
+    // that directory back. Here the parent of the guest root is outside the
+    // mapped tree, so the listing above is empty; resolve the name itself.
+    if (o.matches.empty() && !leaf.empty() && leaf.find_first_of("*?") == std::string::npos) {
+        std::string host = win32_host_path_op(pattern, WIN32_FILE_READ);
+        OsStat st{};
+        if (!host.empty() && os_stat(host.c_str(), &st) == 0) {
+            o.matches.push_back(leaf);
+            o.match_paths.push_back(host);
+        }
+    }
+    if (recomp_env("TRACE_FILES"))
+        LOGW("file: find \"%s\" -> %zu match%s%s%s", pattern.c_str(), o.matches.size(),
+             o.matches.size() == 1 ? "" : "es", o.matches.empty() ? "" : ", first ",
+             o.matches.empty() ? "" : o.matches[0].c_str());
     if (o.matches.empty()) {
         handles().erase(h);
         set_last_error(ERROR_FILE_NOT_FOUND_);
@@ -5733,6 +5845,8 @@ bool kf_EnterCriticalSection(X86 *c) {
     if (!critsec::try_take(cs, t_me->id) && !critsec_spin_take(cs, t_me->id) &&
         !critsec_free_wait_take(cs, t_me->id))
         return false; // exiting: the ordinary shim, with the baton, ends the thread
+    if (traced_cs(cs))
+        LOGW("trace: thread %zu holds CS %08x (free, ret %08x)", t_self, cs, rd32(c->r[R_ESP]));
     set_eax(c, 0);
     return true;
 }
@@ -5748,6 +5862,8 @@ bool kf_LeaveCriticalSection(X86 *c) {
     // Not this thread's: the ordinary shim says so, once.
     if (!t_me || !critsec::atomic_ok(cs) || critsec::owner(cs) != t_me->id)
         return false;
+    if (traced_cs(cs))
+        LOGW("trace: thread %zu leave CS %08x (free)", t_self, cs);
     // A thread running free holds no baton, so it wakes the waiters itself: those waiting on
     // the word, and any parked in the scheduler (which may hold no baton either, now).
     if (critsec::leave(cs, t_me->id) == critsec::Left::Freed) {
@@ -5795,6 +5911,10 @@ bool kf_InterlockedExchange(X86 *c) {
     k_InterlockedExchange(c);
     return true;
 }
+bool kf_InterlockedCompareExchange(X86 *c) {
+    k_InterlockedCompareExchange(c);
+    return true;
+}
 bool kf_QueryPerformanceFrequency(X86 *c) {
     k_QueryPerformanceFrequency(c);
     return true;
@@ -5832,6 +5952,7 @@ const ImportFreeShim g_kernel32_free_shims[] = {
     {"KERNEL32.dll", "InterlockedIncrement", kf_InterlockedIncrement},
     {"KERNEL32.dll", "InterlockedDecrement", kf_InterlockedDecrement},
     {"KERNEL32.dll", "InterlockedExchange", kf_InterlockedExchange},
+    {"KERNEL32.dll", "InterlockedCompareExchange", kf_InterlockedCompareExchange},
     {"KERNEL32.dll", "QueryPerformanceFrequency", kf_QueryPerformanceFrequency},
     {"KERNEL32.dll", "QueryPerformanceCounter", kf_QueryPerformanceCounter},
     {"KERNEL32.dll", "Sleep", kf_Sleep},
@@ -5924,6 +6045,7 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "IsBadReadPtr", 2, k_IsBadReadPtr},
     {"KERNEL32.dll", "IsBadWritePtr", 2, k_IsBadWritePtr},
     {"KERNEL32.dll", "IsBadCodePtr", 1, k_IsBadCodePtr},
+    {"KERNEL32.dll", "IsProcessorFeaturePresent", 1, k_IsProcessorFeaturePresent},
     // time
     {"KERNEL32.dll", "GetTickCount", 0, k_GetTickCount},
     {"KERNEL32.dll", "QueryPerformanceCounter", 1, k_QueryPerformanceCounter},
@@ -5972,6 +6094,7 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "InterlockedIncrement", 1, k_InterlockedIncrement},
     {"KERNEL32.dll", "InterlockedDecrement", 1, k_InterlockedDecrement},
     {"KERNEL32.dll", "InterlockedExchange", 2, k_InterlockedExchange},
+    {"KERNEL32.dll", "InterlockedCompareExchange", 3, k_InterlockedCompareExchange},
     {"KERNEL32.dll", "InitializeCriticalSection", 1, k_InitializeCriticalSection},
     {"KERNEL32.dll", "EnterCriticalSection", 1, k_EnterCriticalSection},
     {"KERNEL32.dll", "LeaveCriticalSection", 1, k_LeaveCriticalSection},

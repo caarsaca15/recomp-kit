@@ -1531,10 +1531,17 @@ void u_MessageBoxW(X86 *c) {
 
 // wvsprintfA: the Win32 subset (%s %c %d %i %u %x %X %% with width/precision
 // and the l/h size prefixes). `va` points at the guest argument array.
+static void format_wsprintf_a(X86 *c, uint32_t out, uint32_t fmt_addr, uint32_t va);
 void u_wvsprintfA(X86 *c) {
-    uint32_t out = arg(c, 0);
-    std::string fmt = gm_str(arg(c, 1), 4096);
-    uint32_t va = arg(c, 2);
+    format_wsprintf_a(c, arg(c, 0), arg(c, 1), arg(c, 2));
+}
+// wsprintfA(out, fmt, ...): cdecl and variadic; the arguments follow the
+// format pointer on the guest stack.
+void u_wsprintfA(X86 *c) {
+    format_wsprintf_a(c, arg(c, 0), arg(c, 1), c->r[R_ESP] + 4 + 8);
+}
+static void format_wsprintf_a(X86 *c, uint32_t out, uint32_t fmt_addr, uint32_t va) {
+    std::string fmt = gm_str(fmt_addr, 4096);
     std::string res;
     size_t i = 0;
     while (i < fmt.size()) {
@@ -1859,6 +1866,7 @@ const ImportShim g_user32_shims[] = {
     {"USER32.dll", "MessageBoxA", 4, u_MessageBoxA},
     {"USER32.dll", "MessageBoxW", 4, u_MessageBoxW},
     {"USER32.dll", "wvsprintfA", 3, u_wvsprintfA},
+    {"USER32.dll", "wsprintfA", ARGC_CDECL, u_wsprintfA},
     // Not imported by D3DPopTB.exe, but registered so GetProcAddress and the
     // host layer can reach them.
     {"USER32.dll", "SendMessageA", 4, u_SendMessageA},

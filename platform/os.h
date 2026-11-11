@@ -146,6 +146,14 @@ int os_exe_path(char *buf, size_t cap); // 0 or -1; NUL-terminated
 // where the platform has no equivalent yet.
 typedef void (*OsFaultFn)(const char *what);
 int os_install_fault_handlers(OsFaultFn fn);
+// A debugging hook: `fn` runs (inside a signal handler, so it may only make
+// raw writes) each time the process is sent the user signal - SIGUSR1 on POSIX.
+// Returns 1 when installed, 0 where the platform has no such signal.
+typedef void (*OsUserSignalFn)(void);
+int os_install_user_signal(OsUserSignalFn fn);
+// For use inside such a handler: create/truncate `path` and write `n` bytes.
+// Returns 0 on success, -1 otherwise.
+int os_write_file_raw(const char *path, const void *data, size_t n);
 // 1 when an installed fault handler writes the host's stack frames to the
 // error stream before calling `fn`, 0 where the platform cannot.
 int os_fault_backtrace_available();

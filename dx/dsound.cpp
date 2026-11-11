@@ -46,6 +46,8 @@
 
 static const uint8_t IID_IDirectSound_[16] =
     IID_BYTES(0x279AFA83, 0x4981, 0x11CE, 0xA5, 0x21, 0x00, 0x20, 0xAF, 0x0B, 0xE5, 0x60);
+static const uint8_t IID_IDirectSoundBuffer8_[16] =
+    IID_BYTES(0x6825A449, 0x7524, 0x4D82, 0x92, 0x0F, 0x50, 0xE3, 0x6A, 0xB3, 0xAB, 0x1E);
 static const uint8_t IID_IDirectSoundBuffer_[16] =
     IID_BYTES(0x279AFA85, 0x4981, 0x11CE, 0xA5, 0x21, 0x00, 0x20, 0xAF, 0x0B, 0xE5, 0x60);
 static const uint8_t IID_IDirectSound3DListener_[16] =
@@ -1144,6 +1146,34 @@ const ComMethod g_dsbuffer[] = {
     {"Restore", 1, Buffer_Restore},
 };
 
+// IDirectSoundBuffer8 appends three methods to IDirectSoundBuffer. There are
+// no DMO effects or hardware voices here: no effects is the only chain a
+// buffer can take, acquiring resources always succeeds (every voice is
+// software), and no object sits in a buffer's path.
+static void Buffer8_SetFX(X86 *c) {
+    const uint32_t count = arg(c, 1), results = arg(c, 3);
+    if (count && results && gm_valid(results, 4 * count))
+        for (uint32_t i = 0; i < count; ++i)
+            wr32(results + 4 * i, 0); // DSFXR_PRESENT unset: not created
+    com_ret(c, count ? DSERR_UNSUPPORTED : DS_OK);
+}
+static void Buffer8_AcquireResources(X86 *c) {
+    com_ret(c, DS_OK);
+}
+static void Buffer8_GetObjectInPath(X86 *c) {
+    const uint32_t out = arg(c, 4);
+    if (out && gm_valid(out, 4))
+        wr32(out, 0);
+    com_ret(c, MAKE_DSHRESULT(4449)); // DSERR_OBJECTNOTFOUND
+}
+static std::vector<ComMethod> dsbuffer8_methods() {
+    std::vector<ComMethod> m(std::begin(g_dsbuffer), std::end(g_dsbuffer));
+    m.push_back({"SetFX", 4, Buffer8_SetFX});
+    m.push_back({"AcquireResources", 4, Buffer8_AcquireResources});
+    m.push_back({"GetObjectInPath", 5, Buffer8_GetObjectInPath});
+    return m;
+}
+
 // ===========================================================================
 // IDirectSound3DBuffer - a view on the same buffer object.
 // ===========================================================================
@@ -1746,9 +1776,20 @@ static ComObj *dsound_create() {
     return com_new(K_DSOUND);
 }
 
+// DirectSoundCreate8 is ordinal 11, with the same arguments; the object
+// already answers the IDirectSound8 methods. EAX.DLL's EAXDirectSoundCreate
+// (5) and EAXDirectSoundCreate8 (6) hand back a DirectSound object too - the
+// EAX extensions themselves are property sets nothing here provides, so a
+// game asking for them through IKsPropertySet gets its usual "no EAX" answer.
 const ImportShim g_dsound_exports[] = {
     {"DSOUND.dll", "ord1", 3, DirectSoundCreate},
     {"DSOUND.dll", "DirectSoundCreate", 3, DirectSoundCreate},
+    {"DSOUND.dll", "ord11", 3, DirectSoundCreate},
+    {"DSOUND.dll", "DirectSoundCreate8", 3, DirectSoundCreate},
+    {"EAX.DLL", "ord5", 3, DirectSoundCreate},
+    {"EAX.DLL", "EAXDirectSoundCreate", 3, DirectSoundCreate},
+    {"EAX.DLL", "ord6", 3, DirectSoundCreate},
+    {"EAX.DLL", "EAXDirectSoundCreate8", 3, DirectSoundCreate},
 };
 
 // A DirectSound object also answers to IDirectSound3DListener, and a buffer to
@@ -1763,6 +1804,18 @@ ComObj *dsbuffer_qi(ComObj *self, ComIface want) {
     if (want == IF_DS3DBUFFER || want == IF_DSNOTIFY)
         return self;
     return nullptr;
+}
+// The listener is reached through the primary buffer, as DirectSound documents
+// it (IDirectSoundBuffer::QueryInterface(IID_IDirectSound3DListener) on the
+// DSBCAPS_PRIMARYBUFFER | DSBCAPS_CTRL3D buffer); the DirectSound object
+// answers too. The listener's state is the process-wide g_listener either way.
+// A secondary buffer is never a listener.
+static bool dsbuffer_view_allowed(const ComObj *self, ComIface want) {
+    if (want == IF_DS3DLISTENER)
+        return self->is_primary_buffer;
+    if (want == IF_DSBUFFER8) // IDirectSoundBuffer8 is a secondary buffer's interface
+        return !self->is_primary_buffer;
+    return true;
 }
 
 void dsbuffer_destroy(ComObj *b) {
@@ -1869,22 +1922,29 @@ void dsound_register() {
     com_define(IF_DS3DLISTENER, "DSOUND.dll", "IDirectSound3DListener", g_ds3dlistener,
                std::size(g_ds3dlistener));
     com_define(IF_DSNOTIFY, "DSOUND.dll", "IDirectSoundNotify", g_dsnotify, std::size(g_dsnotify));
+    static const std::vector<ComMethod> dsbuffer8 = dsbuffer8_methods();
+    com_define(IF_DSBUFFER8, "DSOUND.dll", "IDirectSoundBuffer8", dsbuffer8.data(),
+               dsbuffer8.size());
 
     com_bind(IF_DSOUND, K_DSOUND);
     com_bind(IF_DS3DLISTENER, K_DSOUND);
     com_bind(IF_DSBUFFER, K_DSBUFFER);
     com_bind(IF_DS3DBUFFER, K_DSBUFFER);
     com_bind(IF_DSNOTIFY, K_DSBUFFER);
+    com_bind(IF_DS3DLISTENER, K_DSBUFFER);
+    com_bind(IF_DSBUFFER8, K_DSBUFFER);
 
     com_register_iid(IF_DSOUND, IID_IDirectSound_);
     com_register_iid(IF_DSBUFFER, IID_IDirectSoundBuffer_);
     com_register_iid(IF_DS3DBUFFER, IID_IDirectSound3DBuffer_);
     com_register_iid(IF_DS3DLISTENER, IID_IDirectSound3DListener_);
     com_register_iid(IF_DSNOTIFY, IID_IDirectSoundNotify_);
+    com_register_iid(IF_DSBUFFER8, IID_IDirectSoundBuffer8_);
 
     com_set_destructor(K_DSBUFFER, dsbuffer_destroy);
     com_set_qi_hook(K_DSOUND, dsound_qi);
     com_set_qi_hook(K_DSBUFFER, dsbuffer_qi);
+    com_set_view_filter(K_DSBUFFER, dsbuffer_view_allowed);
 
     com_register_class(CLSID_DirectSound_, "DirectSound", IF_DSOUND, dsound_create);
     com_define(IF_DSOUND8, "DSOUND.dll", "IDirectSound8", g_dsound8, std::size(g_dsound8));

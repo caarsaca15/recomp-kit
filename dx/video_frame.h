@@ -4,6 +4,11 @@
 
 enum VideoSurfaceType : uint32_t {
     VIDEO_XRGB8888 = 3,
+    // BINKSURFACE32A: the same B, G, R bytes with an alpha byte. A video
+    // without an alpha plane is opaque, so it is 0xff - a game that draws the
+    // frame with alpha blending saw nothing when this type was refused and the
+    // texture stayed as it was.
+    VIDEO_ARGB8888 = 5,
     VIDEO_RGB555 = 9,
     VIDEO_RGB565 = 10,
 };

@@ -434,6 +434,34 @@ int os_install_fault_handlers(OsFaultFn fn) {
     return 1;
 }
 
+static OsUserSignalFn g_user_signal_fn = nullptr;
+static void user_signal_trampoline(int) {
+    if (g_user_signal_fn)
+        g_user_signal_fn();
+}
+int os_install_user_signal(OsUserSignalFn fn) {
+    g_user_signal_fn = fn;
+    signal(SIGUSR1, user_signal_trampoline);
+    return 1;
+}
+int os_write_file_raw(const char *path, const void *data, size_t n) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+        return -1;
+    const char *p = (const char *)data;
+    while (n > 0) {
+        ssize_t w = write(fd, p, n);
+        if (w <= 0) {
+            close(fd);
+            return -1;
+        }
+        p += w;
+        n -= (size_t)w;
+    }
+    close(fd);
+    return 0;
+}
+
 int os_fault_backtrace_available() {
 #ifdef OS_HAVE_BACKTRACE
     return 1;

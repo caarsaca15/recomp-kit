@@ -538,6 +538,18 @@ void boot_run() {
         fprintf(stderr, "[host] boot_run without a loaded image\n");
         return;
     }
+    // RECOMP_GUEST_DUMP=<file>: `kill -USR1 <pid>` writes the whole guest arena
+    // there, so a frozen run's data structures can be read without a debugger.
+    if (const char *path = recomp_env("GUEST_DUMP")) {
+        static std::string dump_path = path;
+        if (os_install_user_signal([] {
+                const char done[] = "[host] guest arena written to RECOMP_GUEST_DUMP\n";
+                if (os_write_file_raw(dump_path.c_str(), g_mem, GUEST_SIZE) == 0)
+                    os_write_stderr_raw(done, sizeof done - 1);
+                win32_debug_dump_threads();
+            }))
+            fprintf(stderr, "[host] kill -USR1 writes the guest arena to %s\n", path);
+    }
     if (g_opt.signal_handlers && !os_install_fault_handlers(fault_handler))
         fprintf(stderr, "[host] fault reporting is not available on this platform\n");
 

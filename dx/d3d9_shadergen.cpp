@@ -834,6 +834,23 @@ struct Gen {
             write(in.dst, sample(n, F4 + buf + "(" + S(0) + ").xyz), 0.0, 1.0)", false, false));
             return;
         }
+        case OP_TEXBEM: { // stage dst at texcoord[dst] + BUMPENVMAT * src.rg
+            // The per-stage D3DTSS_BUMPENVMAT* values do not reach the GPU programs
+            // yet (the fixed-function D3DTOP_BUMPENVMAP is drawn without the bump
+            // too), so the stage is sampled at its own, unperturbed coordinate.
+            uint32_t n = in.dst.index & 7;
+            char buf[32];
+            snprintf(buf, sizeof buf, "tc[%u]", n);
+            write(in.dst, sample(n, buf, variant.projected_mask >> n & 1, false));
+            return;
+        }
+        case OP_TEXREG2AR:   // stage dst sampled at (src.a, src.r)
+        case OP_TEXREG2GB: { // stage dst sampled at (src.g, src.b)
+            const char *uv = in.op == OP_TEXREG2AR ? ").wx" : ").yz";
+            write(in.dst,
+                  sample(in.dst.index & 7, F4 + "((" + S(0) + uv + ", 0.0, 1.0)", false, false));
+            return;
+        }
         case OP_TEXDP3: {
             char buf[48];
             snprintf(buf, sizeof buf, "t[%u]", in.dst.index & 7);
@@ -1008,7 +1025,8 @@ bool pixel_source(const Program &p, const PixelVariant &v, std::string *out, std
 uint32_t pixel_sampler_mask(const Program &p) {
     uint32_t mask = 0;
     for (const Inst &in : p.code)
-        if (in.op == OP_TEX || in.op == OP_TEXLDL || in.op == OP_TEXM3X2TEX) {
+        if (in.op == OP_TEX || in.op == OP_TEXLDL || in.op == OP_TEXM3X2TEX || in.op == OP_TEXBEM ||
+            in.op == OP_TEXREG2AR || in.op == OP_TEXREG2GB) {
             if (p.major >= 2)
                 mask |= 1u << (in.src[1].index & 15);
             else

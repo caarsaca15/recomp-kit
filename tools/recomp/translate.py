@@ -573,9 +573,10 @@ def is_vector_insn(mnem, ops):
     EMMS is not one of them here: it names no register and only marks every
     x87 register empty, which the x87 model can do. Codecs call a lone
     `emms; ret` helper unconditionally, whatever CPUID said, so trapping it
-    stopped a game that never used MMX arithmetic at all.
+    stopped a game that never used MMX arithmetic at all. 3DNow!'s FEMMS
+    is the same state change and is treated the same way.
     """
-    if mnem == "EMMS":
+    if mnem in ("EMMS", "FEMMS"):
         return False
     return mnem in VECTOR_MNEM or any(VECTOR_REG_RE.search(o) for o in ops)
 
@@ -5030,9 +5031,11 @@ class Translator(object):
             return L
         if m in ("NOP", "WAIT", "PAUSE"):
             return [";"]
-        if m == "EMMS":
+        if m in ("EMMS", "FEMMS"):
             # Every x87 register empty; TOP and the values are left alone.
-            # Codecs call a bare `emms; ret` whatever CPUID said.
+            # Codecs call a bare `emms; ret` whatever CPUID said. FEMMS (3DNow!)
+            # leaves the MMX values undefined, so the same model holds; its
+            # neighbours name MMn registers and trap as vector instructions.
             return ["c->fpu_tag = 0xffffu;"]
         if m == "STMXCSR":
             # No translated SSE arithmetic changes MXCSR, so expose its reset value.

@@ -397,20 +397,120 @@ void k_GetPrivateProfileStringW(X86 *c) {
         wr16(out + 2, 0);
     set_eax(c, used);
 }
-void k_WritePrivateProfileStringW(X86 *c) {
+// GetPrivateProfileStringA / GetPrivateProfileIntA: the same lookup as the
+// wide call over the same overlay-backed parser, with byte strings. A null
+// section or key asks for the MULTI_SZ list of section or key names, whose
+// size counts each name's terminator but not the final one. As on Windows, a
+// file name without a directory is looked up where the overlay resolves it.
+static bool profile_lookup_a(X86 *c, std::string &result, std::vector<std::string> &names) {
+    std::string section = gm_str(arg(c, 0)), key = gm_str(arg(c, 1));
+    ProfileFile ini;
+    if (!profile_read(gm_str(arg(c, 5)), ini))
+        return false;
+    std::string current, k, value;
+    for (const std::string &line : ini.lines) {
+        if (profile_section(line, current)) {
+            if (!arg(c, 0))
+                names.push_back(current);
+        } else if (equal_name(current, section) && profile_key(line, k, value)) {
+            if (!arg(c, 1))
+                names.push_back(k);
+            else if (equal_name(k, key)) {
+                result = value;
+                return true;
+            }
+        }
+    }
+    return true;
+}
+void k_GetPrivateProfileStringA(X86 *c) {
+    uint32_t out = arg(c, 3), cap = arg(c, 4);
+    std::string result = trim(gm_str(arg(c, 2)));
+    std::vector<std::string> names;
+    if (!profile_lookup_a(c, result, names)) {
+        set_last_error(5);
+        set_eax(c, 0);
+        return;
+    }
+    if (!out || cap == 0) {
+        set_eax(c, 0);
+        return;
+    }
+    if (arg(c, 0) && arg(c, 1)) {
+        set_eax(c, gm_put_str(out, result.c_str(), cap));
+        return;
+    }
+    uint32_t used = 0;
+    wr8(out, 0);
+    if (cap == 1) {
+        set_eax(c, 0);
+        return;
+    }
+    for (const auto &name : names) {
+        uint32_t need = (uint32_t)name.size() + 1;
+        if (need >= cap - used) {
+            gm_put_str(out + used, name.c_str(), cap - used - 1);
+            wr8(out + cap - 2, 0);
+            wr8(out + cap - 1, 0);
+            set_eax(c, cap - 2);
+            return;
+        }
+        used += gm_put_str(out + used, name.c_str(), cap - used) + 1;
+    }
+    wr8(out + used, 0);
+    if (used == 0)
+        wr8(out + 1, 0);
+    set_eax(c, used);
+}
+// GetPrivateProfileIntA(section, key, default, file): the value's leading
+// decimal integer (an optional sign, then digits), else the default.
+void k_GetPrivateProfileIntA(X86 *c) {
+    std::string section = gm_str(arg(c, 0)), key = gm_str(arg(c, 1));
+    uint32_t fallback = arg(c, 2);
+    ProfileFile ini;
+    if (!arg(c, 0) || !arg(c, 1) || !profile_read(gm_str(arg(c, 3)), ini)) {
+        set_eax(c, fallback);
+        return;
+    }
+    std::string current, k, value;
+    for (const std::string &line : ini.lines) {
+        if (profile_section(line, current))
+            continue;
+        if (equal_name(current, section) && profile_key(line, k, value) && equal_name(k, key)) {
+            const char *v = value.c_str();
+            bool negative = *v == '-';
+            if (*v == '-' || *v == '+')
+                ++v;
+            if (!isdigit((unsigned char)*v)) {
+                set_eax(c, 0);
+                return;
+            }
+            uint32_t n = 0;
+            while (isdigit((unsigned char)*v))
+                n = n * 10u + (uint32_t)(*v++ - '0');
+            set_eax(c, negative ? 0u - n : n);
+            return;
+        }
+    }
+    set_eax(c, fallback);
+}
+// WritePrivateProfileStringA/W share this: `wide` says how the four guest
+// string arguments are encoded. The file keeps its own encoding either way.
+static void write_private_profile(X86 *c, bool wide) {
+    auto str = [&](int i) { return wide ? gm_wstr(arg(c, i)) : gm_str(arg(c, i)); };
     if (!arg(c, 0)) {
         set_eax(c, !arg(c, 1) && !arg(c, 2));
         return;
     } // cache flush
     ProfileFile ini;
-    std::string name = gm_wstr(arg(c, 3));
+    std::string name = str(3);
     if (name.empty() || !profile_read(name, ini)) {
         set_last_error(5);
         set_eax(c, 0);
         return;
     }
-    std::string section = gm_wstr(arg(c, 0)), key = gm_wstr(arg(c, 1)), current, k, value;
-    std::string replacement = key + "=" + gm_wstr(arg(c, 2));
+    std::string section = str(0), key = str(1), current, k, value;
+    std::string replacement = key + "=" + str(2);
     std::vector<std::string> lines;
     bool inside = false, found_section = false, found_key = false;
     for (const auto &line : ini.lines) {
@@ -465,6 +565,12 @@ void k_WritePrivateProfileStringW(X86 *c) {
         ok = false;
     win32_invalidate_dir_cache();
     set_eax(c, ok ? 1 : 0);
+}
+void k_WritePrivateProfileStringW(X86 *c) {
+    write_private_profile(c, true);
+}
+void k_WritePrivateProfileStringA(X86 *c) {
+    write_private_profile(c, false);
 }
 
 void k_CreateEventW(X86 *c) {
@@ -1158,7 +1264,10 @@ static const ImportShim g_kernel32_wide[] = {
     {"KERNEL32.dll", "CreateFileMappingW", 6, k_CreateFileMappingW},
 
     {"KERNEL32.dll", "GetPrivateProfileStringW", 6, k_GetPrivateProfileStringW},
+    {"KERNEL32.dll", "GetPrivateProfileStringA", 6, k_GetPrivateProfileStringA},
+    {"KERNEL32.dll", "GetPrivateProfileIntA", 4, k_GetPrivateProfileIntA},
     {"KERNEL32.dll", "WritePrivateProfileStringW", 4, k_WritePrivateProfileStringW},
+    {"KERNEL32.dll", "WritePrivateProfileStringA", 4, k_WritePrivateProfileStringA},
 
     {"KERNEL32.dll", "CreateFileW", 7, k_CreateFileW},
     {"KERNEL32.dll", "FindFirstFileW", 2, k_FindFirstFileW},
