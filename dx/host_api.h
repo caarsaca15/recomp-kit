@@ -340,6 +340,11 @@ void host_pad_rumble(uint16_t low, uint16_t high);
  * Weak defaults: the spec order. */
 const char *host_pad_native_axes(void);
 const char *host_pad_native_buttons(void);
+/* [controls.native] vidpid: the DirectInput DIPROP_VIDPID the pad reports, as
+ * dwData (vendor in the low word, product in the high word), so a game that
+ * picks its button layout by controller model finds a layout it knows. 0, the
+ * weak default, leaves the property unsupported. */
+uint32_t host_pad_native_vidpid(void);
 
 // ---------------------------------------------------------------------------
 // How the guest has been reaching its surfaces.

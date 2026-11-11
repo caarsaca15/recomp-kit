@@ -65,4 +65,8 @@ const char *host_pad_native_buttons(void) {
     return RECOMP_CONTROLS_NATIVE_BUTTONS;
 }
 
+uint32_t host_pad_native_vidpid(void) {
+    return RECOMP_CONTROLS_NATIVE_VIDPID;
+}
+
 } // extern "C"

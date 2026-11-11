@@ -566,6 +566,17 @@ uint32_t property_size(uint32_t prop) {
 } // namespace
 
 bool joy_get_property(ComObj *d, uint32_t prop, uint32_t ph, uint32_t *hr) {
+    // DIPROP_VIDPID (24) and DIPROP_JOYSTICKID (15), DIPROPDWORD each, device-wide.
+    // VIDPID only when the game configures a model ([controls.native] vidpid).
+    if ((prop == 24 && host_pad_native_vidpid()) || prop == 15) {
+        if (!gm_valid(ph, DIPROPDWORD_SIZE) || rd32(ph + DIPH_OFF_dwSize) != DIPROPDWORD_SIZE) {
+            *hr = DIERR_INVALIDPARAM;
+            return true;
+        }
+        wr32(ph + DIPROPDWORD_OFF_dwData, prop == 24 ? host_pad_native_vidpid() : 0);
+        *hr = DI_OK;
+        return true;
+    }
     if (!is_axis_property(prop))
         return false;
     uint32_t size = property_size(prop);

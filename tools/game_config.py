@@ -199,10 +199,18 @@ def load_controls(controls, touch, source):
     controls["mapped"] = mapped
 
     native = dict(controls.get("native", {}))
-    unknown_native = sorted(k for k in native if k not in ("xinput", "dinput", "attached_only", "axes", "buttons"))
+    unknown_native = sorted(k for k in native
+                            if k not in ("xinput", "dinput", "attached_only", "axes", "buttons", "vidpid"))
     if unknown_native:
-        raise ValueError("%s: [controls.native] may name only xinput, dinput, attached_only, axes, buttons, not %s"
-                         % (source, ", ".join(unknown_native)))
+        raise ValueError("%s: [controls.native] may name only xinput, dinput, attached_only, axes, buttons, "
+                         "vidpid, not %s" % (source, ", ".join(unknown_native)))
+    # vidpid = "VVVV:PPPP" (hex): the controller model the DirectInput pad reports
+    # through DIPROP_VIDPID; stored as that property's dwData (product << 16 | vendor).
+    vidpid = native.get("vidpid", "")
+    match = re.match(r"^([0-9A-Fa-f]{4}):([0-9A-Fa-f]{4})$", vidpid) if isinstance(vidpid, str) else None
+    if vidpid and not match:
+        raise ValueError('%s: [controls.native] vidpid must be "VVVV:PPPP" in hex, not %r' % (source, vidpid))
+    native["vidpid"] = (int(match.group(2), 16) << 16 | int(match.group(1), 16)) if match else 0
     native.setdefault("xinput", True)
     native.setdefault("dinput", True)
     native.setdefault("attached_only", False)

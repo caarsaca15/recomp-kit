@@ -129,6 +129,9 @@ HOST_DEFAULT const char *host_pad_native_axes(void) {
 HOST_DEFAULT const char *host_pad_native_buttons(void) {
     return "square,cross,circle,triangle,l1,r1,l2,r2,select,start,l3,r3,ps";
 }
+HOST_DEFAULT uint32_t host_pad_native_vidpid(void) {
+    return 0;
+}
 
 } // extern "C"
 

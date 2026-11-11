@@ -73,6 +73,7 @@ def render_header(cfg):
     lines.append("#define RECOMP_CONTROLS_NATIVE_ATTACHED_ONLY %d" % int(native["attached_only"]))
     lines.append("#define RECOMP_CONTROLS_NATIVE_AXES %s" % c_string(",".join(native["axes"])))
     lines.append("#define RECOMP_CONTROLS_NATIVE_BUTTONS %s" % c_string(",".join(native["buttons"])))
+    lines.append("#define RECOMP_CONTROLS_NATIVE_VIDPID 0x%08xu" % native["vidpid"])
     lines.append("#define RECOMP_GUEST_SIZE %s" % c_hex(game["guest_size"]))
     lines.append("#define RECOMP_RESUMABLE_STACKS %d" %
                  int(cfg["translate"].get("resumable_stacks", False)))
