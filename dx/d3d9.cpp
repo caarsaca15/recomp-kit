@@ -1914,6 +1914,13 @@ static ComObj *device_backbuffer(ComObj *dev) {
 // how a game moves an off-screen target onto the back buffer.
 void Dev_StretchRect(X86 *c) {
     ComObj *src = com_this(arg(c, 1)), *dst = com_this(arg(c, 3));
+    if (src && dst && recomp_env("D3D9_TRACE_NEW")) {
+        static std::map<uint64_t, bool> *seen = new std::map<uint64_t, bool>();
+        if (seen->emplace((uint64_t)src->id << 32 | dst->id, true).second)
+            LOGW("d3d9 frame %u StretchRect %u (%ux%u fmt %08x) -> %u (%ux%u fmt %08x) filter %u",
+                 g_presented_frames, src->id, src->width, src->height, src->rmask, dst->id,
+                 dst->width, dst->height, dst->rmask, arg(c, 5));
+    }
     if (!src || !dst || src->kind != K_D3D9SURFACE || dst->kind != K_D3D9SURFACE) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -2431,6 +2438,58 @@ static void target_viewport(ComObj *dev, const HostD9Target &t, int32_t vp[4]) {
 // The fixed-function programs' constant registers for the draw being built.
 // The host reads a draw's constants while host_d9_draw runs, as it must for
 // the device's own registers, so one set serves every draw.
+// A draw that samples the texture it renders into. Direct3D 9 leaves that
+// undefined, and the hardware of its day read what the target held before the
+// draw; a game's full-screen pass that darkens its scene texture in place,
+// and then copies it on into a motion trail, depends on that. Metal reads and
+// writes one texture in one pass unpredictably (black, here), so the target is
+// copied to a texture of its own first and the copy is what the draw samples.
+// One copy per target, made on first need and kept while the size matches.
+static uint32_t sample_source(ComObj *dev, ComObj *tex) {
+    const D9Pipeline &pl = d9_pipeline(dev->id);
+    ComObj *target = com_get(pl.color_target[0]);
+    if (!target || !tex)
+        return tex ? tex->id : 0;
+    const uint32_t sampled = tex->kind == K_D3D9SURFACE ? tex->id : d9_texture_level0(tex->id);
+    if (sampled != target->id)
+        return tex->id;
+    static std::map<uint32_t, uint32_t> *copies = new std::map<uint32_t, uint32_t>();
+    ComObj *copy = com_get((*copies)[target->id]);
+    ComObj *level = copy ? com_get(copy->back_obj) : nullptr;
+    if (!copy || !level || level->width != target->width || level->height != target->height ||
+        level->rmask != target->rmask) {
+        copy = com_new(K_D3D9TEXTURE);
+        if (!copy)
+            return tex->id;
+        copy->dev_d3d = dev->id;
+        copy->d3d_version = dev->d3d_version;
+        copy->d3d_usage = USAGE_RENDERTARGET;
+        copy->width = target->width;
+        copy->height = target->height;
+        copy->bpp = format_bytes(target->rmask) * 8;
+        copy->rmask = target->rmask;
+        resource_usage()[copy->id] = USAGE_RENDERTARGET;
+        level = make_surface(dev, target->width, target->height, target->rmask);
+        if (!level)
+            return tex->id;
+        level->front_obj = copy->id;
+        level->d3d_usage = USAGE_RENDERTARGET;
+        copy->surfaces.push_back(level->id);
+        copy->back_obj = level->id;
+        (*copies)[target->id] = copy->id;
+        log_once("d3d9.feedback",
+                 "d3d9: a draw samples its own render target; it reads a copy made before it");
+    }
+    uint32_t slot;
+    if (ComObj *owner = com_get(mirror_slot(target, &slot)))
+        gpu_sync(owner);
+    gpu_sync(copy);
+    int32_t rect[4] = {0, 0, (int32_t)target->width, (int32_t)target->height};
+    host_d9_stretch(surface_ref(target), rect, surface_ref(level), rect, 0);
+    gpu_drawn_into(level);
+    return copy->id;
+}
+
 static float g_ffp_vconst[d9ffp::VS_CONSTANTS][4], g_ffp_pconst[d9ffp::PS_CONSTANTS][4];
 
 // What each of the first eight samplers has bound, as the cascade declares it.
@@ -2560,7 +2619,7 @@ static void gpu_draw_fixed(ComObj *dev, HostD9Draw &d) {
         if (!tex || (tex->kind != K_D3D9TEXTURE && tex->kind != K_D3D9SURFACE))
             continue;
         gpu_sync(tex);
-        d.sampler_texture[s] = tex->id;
+        d.sampler_texture[s] = sample_source(dev, tex);
     }
     d.sampler_state = &pl.sampler_state[0][0];
     d.render_state = pl.rs;
@@ -2597,6 +2656,26 @@ static void trace_draw(ComObj *dev, const HostD9Draw &d) {
         pl.viewport[0], pl.viewport[1], pl.viewport[2], pl.viewport[3], rs[7], rs[14], rs[23],
         rs[22], rs[27], rs[19], rs[20], rs[15], rs[24], rs[25], rs[168], rs[28], rs[137],
         pl.sampler_tex[0], pl.tss[0][1], pl.tss[0][4], pl.tss[0][2], pl.tss[0][3]);
+    if (!pl.ps.empty()) {
+        char head[200];
+        int used = 0;
+        const uint8_t *ps = pl.ps.data();
+        for (size_t i = 0; i < 14 && (i + 1) * 4 <= pl.ps.size() && used < (int)sizeof head - 10; ++i)
+            used += snprintf(head + used, sizeof head - used, " %08x", *(const uint32_t *)(ps + i * 4));
+        LOGW("d3d9 frame %u   ps:%s | tex1 %u tex2 %u tex3 %u", g_presented_frames, head,
+             pl.sampler_tex[1], pl.sampler_tex[2], pl.sampler_tex[3]);
+        for (int r = 0; r < 8; ++r)
+            if (pl.pconst[r][0] || pl.pconst[r][1] || pl.pconst[r][2] || pl.pconst[r][3])
+                LOGW("d3d9 frame %u   ps c%d = %g %g %g %g", g_presented_frames, r, pl.pconst[r][0],
+                     pl.pconst[r][1], pl.pconst[r][2], pl.pconst[r][3]);
+    }
+    if (ComObj *t = com_get(pl.sampler_tex[0])) {
+        ComObj *l0 = com_get(d9_texture_level0(t->id));
+        LOGW("d3d9 frame %u   tex0 %u: kind %d %ux%u fmt %08x usage %08x level0 %u%s",
+             g_presented_frames, t->id, (int)t->kind, l0 ? l0->width : t->width,
+             l0 ? l0->height : t->height, l0 ? l0->rmask : t->rmask, t->d3d_usage, l0 ? l0->id : 0,
+             l0 && l0->id == pl.color_target[0] ? " (IS THE BOUND TARGET)" : "");
+    }
     // The first vertex the draw reads, as raw floats/words, and the first matrix.
     ComObj *vb = com_get(pl.stream[0].vb), *ib = com_get(d.index_buffer);
     if (vb && !vb->blob.empty() && pl.stream[0].stride) {
@@ -2622,8 +2701,34 @@ static void trace_draw(ComObj *dev, const HostD9Draw &d) {
         LOGW("d3d9 frame %u   c%d = %g %g %g %g", g_presented_frames, r, pl.vconst[r][0],
              pl.vconst[r][1], pl.vconst[r][2], pl.vconst[r][3]);
 }
+// RECOMP_D3D9_TRACE_NEW: trace_draw for each draw whose shaders, declaration,
+// target size and blend set-up have not been seen before - the passes a
+// short-lived effect adds, without knowing in advance which frame it is in.
+static bool new_draw_kind(ComObj *dev) {
+    static const bool on = recomp_env("D3D9_TRACE_NEW") != nullptr;
+    if (!on)
+        return false;
+    const D9Pipeline &pl = d9_pipeline(dev->id);
+    ComObj *rt = com_get(pl.color_target[0]);
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](uint64_t v) {
+        h ^= v;
+        h *= 1099511628211ull;
+    };
+    mix(pl.vs_key);
+    mix(pl.ps_key);
+    mix(pl.declaration);
+    mix(rt ? (uint64_t)rt->width << 32 | rt->height : 0);
+    for (uint32_t r : {7u, 14u, 15u, 19u, 20u, 27u, 168u})
+        mix(pl.rs[r]);
+    for (int st = 0; st < 4; ++st)
+        mix((uint64_t)pl.tss[st][1] << 32 | pl.tss[st][4]);
+    static std::map<uint64_t, bool> *seen = new std::map<uint64_t, bool>();
+    return seen->emplace(h, true).second;
+}
+
 static void gpu_draw(ComObj *dev, HostD9Draw &d) {
-    if (tracing_frame())
+    if (tracing_frame() || new_draw_kind(dev))
         trace_draw(dev, d);
     D9Pipeline &pl = d9_pipeline(dev->id);
     if (pl.vs.empty() || pl.ps.empty() || declaration_pretransformed(com_get(pl.declaration))) {
@@ -2705,7 +2810,7 @@ static void gpu_draw(ComObj *dev, HostD9Draw &d) {
         if (!tex || (tex->kind != K_D3D9TEXTURE && tex->kind != K_D3D9SURFACE))
             continue;
         gpu_sync(tex);
-        d.sampler_texture[s] = tex->id;
+        d.sampler_texture[s] = sample_source(dev, tex);
     }
     d.sampler_state = &pl.sampler_state[0][0];
     d.render_state = pl.rs;
@@ -3691,6 +3796,21 @@ void Dev_SetPixelShaderConstantF(X86 *c) {
         D9Pipeline &pl = d9_pipeline(dev->id);
         write_registers(pl.pconst, 32, arg(c, 1), arg(c, 2), arg(c, 3));
         pl.pconst_serial = d9_const_serial();
+        // RECOMP_D3D9_TRACE_PCONST=N: every upload that covers pixel register cN,
+        // with its value and the guest code that made it (exact with RECOMP_CS=0).
+        static long reg = -2;
+        if (reg == -2) {
+            const char *v = recomp_env("D3D9_TRACE_PCONST");
+            reg = v ? strtol(v, nullptr, 0) : -1;
+        }
+        const uint32_t start = arg(c, 1), count = arg(c, 3);
+        if (reg >= 0 && (uint32_t)reg >= start && (uint32_t)reg < start + count && reg < 32) {
+            static uint32_t told = 0;
+            if (++told <= 4000)
+                LOGW("d3d9: ps c%ld = %g %g %g %g (upload c%u+%u from %08x, data %08x)", reg,
+                     pl.pconst[reg][0], pl.pconst[reg][1], pl.pconst[reg][2], pl.pconst[reg][3],
+                     start, count, rd32(c->r[R_ESP]), arg(c, 2));
+        }
     }
     com_ret(c, D3D_OK9);
 }
