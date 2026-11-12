@@ -1103,6 +1103,7 @@ static bool tracing_frame() {
 }
 void Dev_Present(X86 *c) {
     ++g_presented_frames;
+    win32_pace_present();
     ComObj *dev = this_device9(c);
     ComObj *bb = dev ? device_backbuffer(dev) : nullptr;
     if (bb && gpu_on()) {

@@ -56,6 +56,8 @@ bool win32_signal_event(uint32_t handle, bool pulse);
 // for, on stderr. Takes the scheduler lock only if it is free, so it can run
 // from a signal handler on a wedged process (see RECOMP_GUEST_DUMP).
 void win32_debug_dump_threads();
+// Present-time frame limit for a game with no frame-clock hook (see kernel32.cpp).
+void win32_pace_present();
 // A kernel event object made by a shim on the guest's behalf (a DirectShow
 // graph's completion event), handed to the guest as a handle it can wait on
 // and close like one CreateEventA returned.

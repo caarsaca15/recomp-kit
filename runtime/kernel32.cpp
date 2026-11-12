@@ -1694,6 +1694,9 @@ void k_GetDriveTypeA(X86 *c) {
 // 0049cfe0 supplies its default 60 (or 24/20/14) Hz limit. Neither deadline
 // drives simulation: 004a5590 uses 005cd92c/005cd930 and the real clock.
 // Return the draw deadline to retire after reading the real host time.
+// Set once a game's own frame-clock hook fires: its draw loop is paced there,
+// and win32_pace_present stands aside.
+static bool g_frame_clock_engaged = false;
 static uint32_t native_frame_clock(X86 *c) {
     using Clock = std::chrono::steady_clock;
     static FrameDeadline deadline;
@@ -1702,6 +1705,7 @@ static uint32_t native_frame_clock(X86 *c) {
     if (caller != RECOMP_HOOK_FRAME_CLOCK_BEGIN && caller != RECOMP_HOOK_FRAME_CLOCK_WAIT &&
         caller != RECOMP_HOOK_FRAME_CLOCK_WAIT_CLAMP)
         return 0;
+    g_frame_clock_engaged = true;
     if (recomp_env("PIN_CLOCK"))
         return 0;
     const int requested = mods_display_fps();
@@ -1732,6 +1736,27 @@ static uint32_t native_frame_clock(X86 *c) {
     }
     return 0;
 }
+} // namespace
+// The frame limit (settings: Frame limit) for a game whose draw loop has no
+// frame-clock hook: each Present waits, cooperatively, until a frame period
+// after the last one. FrameDeadline keeps the period fractional, so 60 is 60
+// and not 1000 / 17, and a late frame starts a new phase instead of a burst.
+void win32_pace_present() {
+    if (g_frame_clock_engaged || recomp_env("PIN_CLOCK"))
+        return;
+    using Clock = std::chrono::steady_clock;
+    static FrameDeadline deadline;
+    auto now = [] {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   Clock::now().time_since_epoch())
+            .count();
+    };
+    const int requested = mods_display_fps();
+    if (const uint32_t ms = deadline.wait_ms(now()))
+        sched_sleep_ms(ms);
+    deadline.begin(requested, now());
+}
+namespace {
 void k_GetTickCount(X86 *c) {
     const uint32_t draw_deadline = native_frame_clock(c);
     // The cadence trace's main signal: this game's frame limiter spins here,
